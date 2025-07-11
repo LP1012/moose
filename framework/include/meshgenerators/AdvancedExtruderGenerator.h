@@ -63,6 +63,11 @@ protected:
   /// The direction of the extrusion
   Point _direction;
 
+  /// Name of extrusion curve
+  // const MeshGeneratorName _extrusion_curve;
+  std::unique_ptr<MeshBase> & _extrusion_curve;
+  bool _extrude_along_curve;
+
   const bool _has_top_boundary;
   const BoundaryName _top_boundary;
 

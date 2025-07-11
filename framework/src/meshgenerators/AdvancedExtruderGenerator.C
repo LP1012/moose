@@ -56,17 +56,21 @@ AdvancedExtruderGenerator::validParams()
   params.addClassDescription(
       "Extrudes a 1D mesh into 2D, or a 2D mesh into 3D, can have a variable height for each "
       "elevation, variable number of layers within each elevation, variable growth factors of "
-      "axial element sizes within each elevation and remap subdomain_ids, boundary_ids and element "
-      "extra integers within each elevation as well as interface boundaries between neighboring "
-      "elevation layers.");
+      "axial element sizes within each elevation and remap subdomain_ids, boundary_ids and "
+      "element "
+      "extra integers within each elevation as well as interface boundaries between "
+      "neighboring "
+      "elevation layers."); // UPDATE THIS
 
-  params.addRequiredParam<std::vector<Real>>("heights", "The height of each elevation");
+  params.addParam<std::vector<Real>>("heights", "The height of each elevation");
 
   params.addRangeCheckedParam<std::vector<Real>>(
       "biases", "biases>0.0", "The axial growth factor used for mesh biasing for each elevation.");
 
-  params.addRequiredParam<std::vector<unsigned int>>(
-      "num_layers", "The number of layers for each elevation - must be num_elevations in length!");
+  params.addParam<std::vector<unsigned int>>(
+      "num_layers",
+      {},
+      "The number of layers for each elevation - must be num_elevations in length!");
 
   params.addParam<std::vector<std::vector<subdomain_id_type>>>(
       "subdomain_swaps",
@@ -93,10 +97,13 @@ AdvancedExtruderGenerator::validParams()
       "swapped, the enties are stacked based on the order provided in "
       "'elem_integer_names_to_swap' to form the third dimension.");
 
-  params.addRequiredParam<Point>(
-      "direction",
-      "A vector that points in the direction to extrude (note, this will be "
-      "normalized internally - so don't worry about it here)");
+  params.addParam<Point>("direction",
+                         Point(0, 0, 0),
+                         "A vector that points in the direction to extrude (note, this will be "
+                         "normalized internally - so don't worry about it here)");
+
+  params.addParam<MeshGeneratorName>(
+      "extrusion_curve", "NONE", "Name of the mesh generator providing the extrusion curve.");
 
   params.addParam<BoundaryName>(
       "top_boundary",
@@ -128,6 +135,7 @@ AdvancedExtruderGenerator::validParams()
                         0,
                         "Pitch for helicoidal extrusion around an axis going through the origin "
                         "following the direction vector");
+
   return params;
 }
 
@@ -144,6 +152,8 @@ AdvancedExtruderGenerator::AdvancedExtruderGenerator(const InputParameters & par
     _elem_integers_swaps(
         getParam<std::vector<std::vector<std::vector<dof_id_type>>>>("elem_integers_swaps")),
     _direction(getParam<Point>("direction")),
+    _extrusion_curve(getMesh("extrusion_curve")),
+    _extrude_along_curve(isParamValid("extrusion_curve")),
     _has_top_boundary(isParamValid("top_boundary")),
     _top_boundary(isParamValid("top_boundary") ? getParam<BoundaryName>("top_boundary") : "0"),
     _has_bottom_boundary(isParamValid("bottom_boundary")),
@@ -171,118 +181,142 @@ AdvancedExtruderGenerator::AdvancedExtruderGenerator(const InputParameters & par
                                                          std::vector<boundary_id_type>())),
     _twist_pitch(getParam<Real>("twist_pitch"))
 {
-  if (!_direction.norm())
-    paramError("direction", "Must have some length!");
-
-  // Normalize it
-  _direction /= _direction.norm();
-
-  const auto num_elevations = _heights.size();
-
-  if (_num_layers.size() != num_elevations)
-    paramError("heights", "The length of 'heights' and 'num_layers' must be the same in ", name());
-
-  if (_subdomain_swaps.size() && (_subdomain_swaps.size() != num_elevations))
-    paramError("subdomain_swaps",
-               "If specified, 'subdomain_swaps' (" + std::to_string(_subdomain_swaps.size()) +
-                   ") must be the same length as 'heights' (" + std::to_string(num_elevations) +
-                   ") in ",
-               name());
-
-  try
+  // check if direction has been passed
+  if (!_extrude_along_curve)
   {
-    MooseMeshUtils::idSwapParametersProcessor(
-        name(), "subdomain_swaps", _subdomain_swaps, _subdomain_swap_pairs);
-  }
-  catch (const MooseException & e)
-  {
-    paramError("subdomain_swaps", e.what());
-  }
-
-  if (_boundary_swaps.size() && (_boundary_swaps.size() != num_elevations))
-    paramError("boundary_swaps",
-               "If specified, 'boundary_swaps' (" + std::to_string(_boundary_swaps.size()) +
-                   ") must be the same length as 'heights' (" + std::to_string(num_elevations) +
-                   ") in ",
-               name());
-
-  try
-  {
-    MooseMeshUtils::idSwapParametersProcessor(
-        name(), "boundary_swaps", _boundary_swaps, _boundary_swap_pairs);
-  }
-  catch (const MooseException & e)
-  {
-    paramError("boundary_swaps", e.what());
-  }
-
-  if (_elem_integers_swaps.size() &&
-      _elem_integers_swaps.size() != _elem_integer_names_to_swap.size())
-    paramError("elem_integers_swaps",
-               "If specified, 'elem_integers_swaps' must have the same length as the length of "
-               "'elem_integer_names_to_swap'.");
-
-  for (const auto & unit_elem_integers_swaps : _elem_integers_swaps)
-    if (unit_elem_integers_swaps.size() != num_elevations)
-      paramError("elem_integers_swaps",
-                 "If specified, each element of 'elem_integers_swaps' must have the same length as "
-                 "the length of 'heights'.");
-
-  try
-  {
-    MooseMeshUtils::extraElemIntegerSwapParametersProcessor(name(),
-                                                            num_elevations,
-                                                            _elem_integer_names_to_swap.size(),
-                                                            _elem_integers_swaps,
-                                                            _elem_integers_swap_pairs);
-  }
-  catch (const MooseException & e)
-  {
-    paramError("elem_integers_swaps", e.what());
-  }
-
-  bool has_negative_entry = false;
-  bool has_positive_entry = false;
-  for (const auto & h : _heights)
-  {
-    if (h > 0.0)
-      has_positive_entry = true;
+    if (!isParamValid("direction"))
+      paramError("direction",
+                 "direction and extrusion_curve are invalid. At least one of these parameters must "
+                 "be set!");
     else
-      has_negative_entry = true;
+    {
+      // check to ensure required parameters are given
+      if (!isParamValid("heights"))
+        paramError("heights", "heights must be set to extrude input mesh!");
+      if (!isParamValid("num_layers"))
+        paramError("num_layers", "num_layers must be set to extrude input mesh!");
+
+      // Normalize given direction vector
+      _direction /= _direction.norm();
+
+      // define number of elevations based on user input
+      const auto num_elevations = _heights.size();
+
+      // add additional checks:
+      if (_num_layers.size() != num_elevations)
+        paramError(
+            "heights", "The length of 'heights' and 'num_layers' must be the same in ", name());
+
+      if (_subdomain_swaps.size() && (_subdomain_swaps.size() != num_elevations))
+        paramError("subdomain_swaps",
+                   "If specified, 'subdomain_swaps' (" + std::to_string(_subdomain_swaps.size()) +
+                       ") must be the same length as 'heights' (" + std::to_string(num_elevations) +
+                       ") in ",
+                   name());
+      //----------------------------------------------------------------------------------------------
+      // THE FOLLOWING WILL NEED TO BE CHECKED!!!
+      //----------------------------------------------------------------------------------------------
+      try
+      {
+        MooseMeshUtils::idSwapParametersProcessor(
+            name(), "subdomain_swaps", _subdomain_swaps, _subdomain_swap_pairs);
+      }
+      catch (const MooseException & e)
+      {
+        paramError("subdomain_swaps", e.what());
+      }
+
+      if (_boundary_swaps.size() && (_boundary_swaps.size() != num_elevations))
+        paramError("boundary_swaps",
+                   "If specified, 'boundary_swaps' (" + std::to_string(_boundary_swaps.size()) +
+                       ") must be the same length as 'heights' (" + std::to_string(num_elevations) +
+                       ") in ",
+                   name());
+
+      try
+      {
+        MooseMeshUtils::idSwapParametersProcessor(
+            name(), "boundary_swaps", _boundary_swaps, _boundary_swap_pairs);
+      }
+      catch (const MooseException & e)
+      {
+        paramError("boundary_swaps", e.what());
+      }
+
+      if (_elem_integers_swaps.size() &&
+          _elem_integers_swaps.size() != _elem_integer_names_to_swap.size())
+        paramError("elem_integers_swaps",
+                   "If specified, 'elem_integers_swaps' must have the same length as the length of "
+                   "'elem_integer_names_to_swap'.");
+
+      for (const auto & unit_elem_integers_swaps : _elem_integers_swaps)
+        if (unit_elem_integers_swaps.size() != num_elevations)
+          paramError(
+              "elem_integers_swaps",
+              "If specified, each element of 'elem_integers_swaps' must have the same length as "
+              "the length of 'heights'.");
+
+      try
+      {
+        MooseMeshUtils::extraElemIntegerSwapParametersProcessor(name(),
+                                                                num_elevations,
+                                                                _elem_integer_names_to_swap.size(),
+                                                                _elem_integers_swaps,
+                                                                _elem_integers_swap_pairs);
+      }
+      catch (const MooseException & e)
+      {
+        paramError("elem_integers_swaps", e.what());
+      }
+
+      bool has_negative_entry = false;
+      bool has_positive_entry = false;
+      for (const auto & h : _heights)
+      {
+        if (h > 0.0)
+          has_positive_entry = true;
+        else
+          has_negative_entry = true;
+      }
+
+      if (has_negative_entry && has_positive_entry)
+        paramError("heights", "Cannot have both positive and negative heights!");
+      if (_biases.size() != _heights.size())
+        paramError("biases", "Size of this parameter, if provided, must be the same as heights.");
+
+      if (_upward_boundary_source_blocks.size() != _upward_boundary_ids.size() ||
+          _upward_boundary_ids.size() != num_elevations)
+        paramError("upward_boundary_ids",
+                   "This parameter must have the same length (" +
+                       std::to_string(_upward_boundary_ids.size()) +
+                       ") as upward_boundary_source_blocks (" +
+                       std::to_string(_upward_boundary_source_blocks.size()) + ") and heights (" +
+                       std::to_string(num_elevations) + ")");
+      for (unsigned int i = 0; i < _upward_boundary_source_blocks.size(); i++)
+        if (_upward_boundary_source_blocks[i].size() != _upward_boundary_ids[i].size())
+          paramError(
+              "upward_boundary_ids",
+              "Every element of this parameter must have the same length as the corresponding "
+              "element of upward_boundary_source_blocks.");
+
+      if (_downward_boundary_source_blocks.size() != _downward_boundary_ids.size() ||
+          _downward_boundary_ids.size() != num_elevations)
+        paramError("downward_boundary_ids",
+                   "This parameter must have the same length (" +
+                       std::to_string(_downward_boundary_ids.size()) +
+                       ") as downward_boundary_source_blocks (" +
+                       std::to_string(_downward_boundary_source_blocks.size()) + ") and heights (" +
+                       std::to_string(num_elevations) + ")");
+      for (unsigned int i = 0; i < _downward_boundary_source_blocks.size(); i++)
+        if (_downward_boundary_source_blocks[i].size() != _downward_boundary_ids[i].size())
+          paramError(
+              "downward_boundary_ids",
+              "Every element of this parameter must have the same length as the corresponding "
+              "element of downward_boundary_source_blocks.");
+    }
+    //----------------------------------------------------------------------------------------------
+    //----------------------------------------------------------------------------------------------
   }
-
-  if (has_negative_entry && has_positive_entry)
-    paramError("heights", "Cannot have both positive and negative heights!");
-  if (_biases.size() != _heights.size())
-    paramError("biases", "Size of this parameter, if provided, must be the same as heights.");
-
-  if (_upward_boundary_source_blocks.size() != _upward_boundary_ids.size() ||
-      _upward_boundary_ids.size() != num_elevations)
-    paramError("upward_boundary_ids",
-               "This parameter must have the same length (" +
-                   std::to_string(_upward_boundary_ids.size()) +
-                   ") as upward_boundary_source_blocks (" +
-                   std::to_string(_upward_boundary_source_blocks.size()) + ") and heights (" +
-                   std::to_string(num_elevations) + ")");
-  for (unsigned int i = 0; i < _upward_boundary_source_blocks.size(); i++)
-    if (_upward_boundary_source_blocks[i].size() != _upward_boundary_ids[i].size())
-      paramError("upward_boundary_ids",
-                 "Every element of this parameter must have the same length as the corresponding "
-                 "element of upward_boundary_source_blocks.");
-
-  if (_downward_boundary_source_blocks.size() != _downward_boundary_ids.size() ||
-      _downward_boundary_ids.size() != num_elevations)
-    paramError("downward_boundary_ids",
-               "This parameter must have the same length (" +
-                   std::to_string(_downward_boundary_ids.size()) +
-                   ") as downward_boundary_source_blocks (" +
-                   std::to_string(_downward_boundary_source_blocks.size()) + ") and heights (" +
-                   std::to_string(num_elevations) + ")");
-  for (unsigned int i = 0; i < _downward_boundary_source_blocks.size(); i++)
-    if (_downward_boundary_source_blocks[i].size() != _downward_boundary_ids[i].size())
-      paramError("downward_boundary_ids",
-                 "Every element of this parameter must have the same length as the corresponding "
-                 "element of downward_boundary_source_blocks.");
 }
 
 std::unique_ptr<MeshBase>
@@ -294,6 +328,14 @@ AdvancedExtruderGenerator::generate()
 
   auto mesh = buildMeshBaseObject(_input->mesh_dimension() + 1);
   mesh->set_mesh_dimension(_input->mesh_dimension() + 1);
+  if (_extrude_along_curve)
+  {
+    // if extruding along a curve, mesh dimension will not change
+    mesh = buildMeshBaseObject(_input->mesh_dimension());
+    mesh->set_mesh_dimension(_input->mesh_dimension());
+    // std::unique_ptr<MeshBase> & extrusion_mesh = libMesh::getMesh(_extrusion_curve); // get 1D
+    // curve to extrude along
+  }
 
   // Check if the element integer names are existent in the input mesh.
   for (unsigned int i = 0; i < _elem_integer_names_to_swap.size(); i++)
@@ -386,7 +428,10 @@ AdvancedExtruderGenerator::generate()
       _has_top_boundary ? new_boundary_ids.back() : libMesh::BoundaryInfo::invalid_id;
 
   // We know a priori how many elements we'll need
-  mesh->reserve_elem(total_num_layers * orig_elem);
+  if (!_extrude_along_curve)
+    mesh->reserve_elem(total_num_layers * orig_elem);
+  else
+    mesh->reserve_elem(_extrusion_curve->n_nodes() * orig_elem);
 
   // Look for higher order elements which introduce an extra layer
   std::set<ElemType> higher_orders = {EDGE3, EDGE4, TRI6, TRI7, QUAD8, QUAD9};
@@ -404,74 +449,82 @@ AdvancedExtruderGenerator::generate()
   mesh->comm().max(extruding_quad_eights);
 
   // Reserve for the max number possibly needed
-  mesh->reserve_nodes((order * total_num_layers + 1) * orig_nodes);
+  if (!_extrude_along_curve)
+    mesh->reserve_nodes((order * total_num_layers + 1) * orig_nodes);
+  else
+    mesh->reserve_nodes((order * _extrusion_curve->n_nodes() + 1) * orig_nodes);
 
   // Container to catch the boundary IDs handed back by the BoundaryInfo object
   std::vector<boundary_id_type> ids_to_copy;
 
-  Point old_distance;
-  Point current_distance;
-
   // Create translated layers of nodes in the direction of extrusion
   for (const auto & node : input->node_ptr_range())
   {
-    unsigned int current_node_layer = 0;
 
-    old_distance.zero();
-
-    // e is the elevation layer ordering
-    for (unsigned int e = 0; e < total_num_elevations; e++)
+    // Two different methods to calculate extruded nodes are defined here. One method is for
+    // extruding a mesh to another dimension, while the other is for extruding along a curve.
+    if (!_extrude_along_curve)
     {
-      auto num_layers = _num_layers[e];
+      unsigned int current_node_layer = 0;
 
-      auto height = _heights[e];
+      Point old_distance;
+      Point current_distance;
 
-      auto bias = _biases[e];
+      old_distance.zero();
 
-      // k is the element layer ordering within each elevation layer
-      for (unsigned int k = 0; k < order * num_layers + (e == 0 ? 1 : 0); ++k)
+      // e is the elevation layer ordering
+      for (unsigned int e = 0; e < total_num_elevations; e++)
       {
-        // For the first layer we don't need to move
-        if (e == 0 && k == 0)
-          current_distance.zero();
-        else
+        auto num_layers = _num_layers[e];
+
+        auto height = _heights[e];
+
+        auto bias = _biases[e];
+
+        // k is the element layer ordering within each elevation layer
+        for (unsigned int k = 0; k < order * num_layers + (e == 0 ? 1 : 0); ++k)
         {
-          // Shift the previous position by a certain fraction of 'height' along the extrusion
-          // direction to get the new position.
-          auto layer_index = (k - (e == 0 ? 1 : 0)) / order + 1;
-
-          const auto step_size = MooseUtils::absoluteFuzzyEqual(bias, 1.0)
-                                     ? height / (Real)num_layers / (Real)order
-                                     : height * std::pow(bias, (Real)(layer_index - 1)) *
-                                           (1.0 - bias) /
-                                           (1.0 - std::pow(bias, (Real)(num_layers))) / (Real)order;
-
-          current_distance = old_distance + _direction * step_size;
-
-          // Handle helicoidal extrusion
-          if (!MooseUtils::absoluteFuzzyEqual(_twist_pitch, 0.))
+          // For the first layer we don't need to move
+          if (e == 0 && k == 0)
+            current_distance.zero();
+          else
           {
-            // twist 1 should be 'normal' to the extruded shape
-            RealVectorValue twist1 = _direction.cross(*node);
-            // This happens for any node on the helicoidal extrusion axis
-            if (!MooseUtils::absoluteFuzzyEqual(twist1.norm(), .0))
-              twist1 /= twist1.norm();
-            const RealVectorValue twist2 = twist1.cross(_direction);
+            // Shift the previous position by a certain fraction of 'height' along the extrusion
+            // direction to get the new position.
+            auto layer_index = (k - (e == 0 ? 1 : 0)) / order + 1;
 
-            auto twist = (cos(2. * libMesh::pi * layer_index * step_size / _twist_pitch) -
-                          cos(2. * libMesh::pi * (layer_index - 1) * step_size / _twist_pitch)) *
-                             twist2 +
-                         (sin(2. * libMesh::pi * layer_index * step_size / _twist_pitch) -
-                          sin(2. * libMesh::pi * (layer_index - 1) * step_size / _twist_pitch)) *
-                             twist1;
-            twist *= std::sqrt(node->norm_sq() + libMesh::Utility::pow<2>(_direction * (*node)));
-            current_distance += twist;
+            const auto step_size =
+                MooseUtils::absoluteFuzzyEqual(bias, 1.0)
+                    ? height / (Real)num_layers / (Real)order
+                    : height * std::pow(bias, (Real)(layer_index - 1)) * (1.0 - bias) /
+                          (1.0 - std::pow(bias, (Real)(num_layers))) / (Real)order;
+
+            current_distance = old_distance + _direction * step_size;
+
+            // Handle helicoidal extrusion
+            if (!MooseUtils::absoluteFuzzyEqual(_twist_pitch, 0.))
+            {
+              // twist 1 should be 'normal' to the extruded shape
+              RealVectorValue twist1 = _direction.cross(*node);
+              // This happens for any node on the helicoidal extrusion axis
+              if (!MooseUtils::absoluteFuzzyEqual(twist1.norm(), .0))
+                twist1 /= twist1.norm();
+              const RealVectorValue twist2 = twist1.cross(_direction);
+
+              auto twist = (cos(2. * libMesh::pi * layer_index * step_size / _twist_pitch) -
+                            cos(2. * libMesh::pi * (layer_index - 1) * step_size / _twist_pitch)) *
+                               twist2 +
+                           (sin(2. * libMesh::pi * layer_index * step_size / _twist_pitch) -
+                            sin(2. * libMesh::pi * (layer_index - 1) * step_size / _twist_pitch)) *
+                               twist1;
+              twist *= std::sqrt(node->norm_sq() + libMesh::Utility::pow<2>(_direction * (*node)));
+              current_distance += twist;
+            }
           }
-        }
 
-        Node * new_node = mesh->add_point(*node + current_distance,
-                                          node->id() + (current_node_layer * orig_nodes),
-                                          node->processor_id());
+          Node * new_node = mesh->add_point(*node + current_distance,
+                                            node->id() + (current_node_layer * orig_nodes),
+                                            node->processor_id());
 
 #ifdef LIBMESH_ENABLE_UNIQUE_ID
         // Let's give the base of the extruded mesh the same
@@ -500,6 +553,56 @@ AdvancedExtruderGenerator::generate()
 
         old_distance = current_distance;
         current_node_layer++;
+        }
+      }
+    }
+    else
+    {
+      libMesh::Node * P_next;
+      libMesh::Node * P_current;
+      libMesh::RealVectorValue travel_vector;
+      for (const auto i : make_range(_extrusion_curve->n_nodes() - 1))
+      {
+        // Define the current and next node on the extrusion curve.
+        P_current = _extrusion_curve->node_ptr(i);
+        P_next = _extrusion_curve->node_ptr(i + 1);
+
+        // Calculate direction vector. this is also the normal vector of the plane to be
+        // interesected.
+        _direction = *P_next - *P_current;
+
+        // Calculate the vector that must be traveled to the intersection of the line defined by the
+        // current node and direction vector and the plane defined by the direction vector at the
+        // next point along the extrusion curve.
+        travel_vector = ((*P_next - *node) * _direction / (_direction * _direction)) * _direction;
+        Node * new_node = mesh->add_point(
+            *node + travel_vector, node->id() + (i * orig_nodes), node->processor_id());
+
+        // This might be completely wrong... Code was copied from above, then parameters e and
+        // current_node_layer were changed to i from the loop it is in... MAKE SURE TO CHECK BEFORE
+        // PR IS SUBMITTED!
+#ifdef LIBMESH_ENABLE_UNIQUE_ID
+        // Let's give the base of the extruded mesh the same
+        // unique_ids as the source mesh, in case anyone finds that
+        // a useful map to preserve.
+        const unique_id_type uid =
+            (i == 0) ? node->unique_id()
+                     : orig_unique_ids + (i - 1) * (orig_nodes + orig_elem) + node->id();
+
+        new_node->set_unique_id(uid);
+#endif
+
+        input_boundary_info.boundary_ids(node, ids_to_copy);
+        if (_boundary_swap_pairs.empty())
+          boundary_info.add_node(new_node, ids_to_copy);
+        else
+          for (const auto & id_to_copy : ids_to_copy)
+          {
+            boundary_info.add_node(new_node,
+                                   _boundary_swap_pairs[i].count(id_to_copy)
+                                       ? _boundary_swap_pairs[i][id_to_copy]
+                                       : id_to_copy);
+          }
       }
     }
   }
