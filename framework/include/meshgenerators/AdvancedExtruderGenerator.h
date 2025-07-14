@@ -30,7 +30,7 @@ protected:
   std::unique_ptr<MeshBase> & _input;
 
   /// Height of each elevation
-  const std::vector<Real> & _heights;
+  const std::vector<Real> _heights;
 
   /// Bias growth factor of each elevation
   const std::vector<Real> _biases;

@@ -62,7 +62,7 @@ AdvancedExtruderGenerator::validParams()
       "neighboring "
       "elevation layers."); // UPDATE THIS
 
-  params.addParam<std::vector<Real>>("heights", "The height of each elevation");
+  params.addParam<std::vector<Real>>("heights", {}, "The height of each elevation");
 
   params.addRangeCheckedParam<std::vector<Real>>(
       "biases", "biases>0.0", "The axial growth factor used for mesh biasing for each elevation.");
@@ -102,8 +102,8 @@ AdvancedExtruderGenerator::validParams()
                          "A vector that points in the direction to extrude (note, this will be "
                          "normalized internally - so don't worry about it here)");
 
-  params.addParam<MeshGeneratorName>(
-      "extrusion_curve", "NONE", "Name of the mesh generator providing the extrusion curve.");
+  params.addParam<MeshGeneratorName>("extrusion_curve",
+                                     "Name of the mesh generator providing the extrusion curve.");
 
   params.addParam<BoundaryName>(
       "top_boundary",
@@ -139,6 +139,9 @@ AdvancedExtruderGenerator::validParams()
   return params;
 }
 
+// FIX EXTRUSION_CURVE IN CONSTRUCTOR
+// previously tried setting to a nullptr, but that was not accepted :-(
+
 AdvancedExtruderGenerator::AdvancedExtruderGenerator(const InputParameters & parameters)
   : MeshGenerator(parameters),
     _input(getMesh("input")),
@@ -152,7 +155,8 @@ AdvancedExtruderGenerator::AdvancedExtruderGenerator(const InputParameters & par
     _elem_integers_swaps(
         getParam<std::vector<std::vector<std::vector<dof_id_type>>>>("elem_integers_swaps")),
     _direction(getParam<Point>("direction")),
-    _extrusion_curve(getMesh("extrusion_curve")),
+    _extrusion_curve(isParamValid("extrusion_curve") ? getMesh("extrusion_curve")
+                                                     : getMesh("extrusion_curve")),
     _extrude_along_curve(isParamValid("extrusion_curve")),
     _has_top_boundary(isParamValid("top_boundary")),
     _top_boundary(isParamValid("top_boundary") ? getParam<BoundaryName>("top_boundary") : "0"),
@@ -184,16 +188,16 @@ AdvancedExtruderGenerator::AdvancedExtruderGenerator(const InputParameters & par
   // check if direction has been passed
   if (!_extrude_along_curve)
   {
-    if (!isParamValid("direction"))
+    if (_direction.norm() < libMesh::TOLERANCE)
       paramError("direction",
                  "direction and extrusion_curve are invalid. At least one of these parameters must "
                  "be set!");
     else
     {
       // check to ensure required parameters are given
-      if (!isParamValid("heights"))
+      if (_heights.empty())
         paramError("heights", "heights must be set to extrude input mesh!");
-      if (!isParamValid("num_layers"))
+      if (_num_layers.empty())
         paramError("num_layers", "num_layers must be set to extrude input mesh!");
 
       // Normalize given direction vector
@@ -313,9 +317,9 @@ AdvancedExtruderGenerator::AdvancedExtruderGenerator(const InputParameters & par
               "downward_boundary_ids",
               "Every element of this parameter must have the same length as the corresponding "
               "element of downward_boundary_source_blocks.");
+    //----------------------------------------------------------------------------------------------
+    //----------------------------------------------------------------------------------------------
     }
-    //----------------------------------------------------------------------------------------------
-    //----------------------------------------------------------------------------------------------
   }
 }
 
@@ -328,14 +332,6 @@ AdvancedExtruderGenerator::generate()
 
   auto mesh = buildMeshBaseObject(_input->mesh_dimension() + 1);
   mesh->set_mesh_dimension(_input->mesh_dimension() + 1);
-  if (_extrude_along_curve)
-  {
-    // if extruding along a curve, mesh dimension will not change
-    mesh = buildMeshBaseObject(_input->mesh_dimension());
-    mesh->set_mesh_dimension(_input->mesh_dimension());
-    // std::unique_ptr<MeshBase> & extrusion_mesh = libMesh::getMesh(_extrusion_curve); // get 1D
-    // curve to extrude along
-  }
 
   // Check if the element integer names are existent in the input mesh.
   for (unsigned int i = 0; i < _elem_integer_names_to_swap.size(); i++)
@@ -392,9 +388,10 @@ AdvancedExtruderGenerator::generate()
                    "' was not found within the mesh");
 
   std::unique_ptr<MeshBase> input = std::move(_input);
+  std::unique_ptr<MeshBase> extrusion_curve = std::move(_extrusion_curve);
 
-  // If we're using a distributed mesh... then make sure we don't have any remote elements hanging
-  // around
+  // If we're using a distributed mesh... then make sure we don't have any remote elements
+  // hanging around
   if (!input->is_serial())
     mesh->delete_remote_elements();
 
@@ -431,7 +428,7 @@ AdvancedExtruderGenerator::generate()
   if (!_extrude_along_curve)
     mesh->reserve_elem(total_num_layers * orig_elem);
   else
-    mesh->reserve_elem(_extrusion_curve->n_nodes() * orig_elem);
+    mesh->reserve_elem(extrusion_curve->n_nodes() * orig_elem);
 
   // Look for higher order elements which introduce an extra layer
   std::set<ElemType> higher_orders = {EDGE3, EDGE4, TRI6, TRI7, QUAD8, QUAD9};
@@ -452,7 +449,7 @@ AdvancedExtruderGenerator::generate()
   if (!_extrude_along_curve)
     mesh->reserve_nodes((order * total_num_layers + 1) * orig_nodes);
   else
-    mesh->reserve_nodes((order * _extrusion_curve->n_nodes() + 1) * orig_nodes);
+    mesh->reserve_nodes((order * extrusion_curve->n_nodes() + 1) * orig_nodes);
 
   // Container to catch the boundary IDs handed back by the BoundaryInfo object
   std::vector<boundary_id_type> ids_to_copy;
@@ -561,22 +558,29 @@ AdvancedExtruderGenerator::generate()
       libMesh::Node * P_next;
       libMesh::Node * P_current;
       libMesh::RealVectorValue travel_vector;
-      for (const auto i : make_range(_extrusion_curve->n_nodes() - 1))
+
+      std::cout << "Starting loop..." << std::endl;
+      for (const auto i : make_range(extrusion_curve->n_nodes() - 1))
       {
+        std::cout << "\ni=" << i << std::endl;
         // Define the current and next node on the extrusion curve.
-        P_current = _extrusion_curve->node_ptr(i);
-        P_next = _extrusion_curve->node_ptr(i + 1);
+        P_current = extrusion_curve->node_ptr(i);
+        P_next = extrusion_curve->node_ptr(i + 1);
 
         // Calculate direction vector. this is also the normal vector of the plane to be
         // interesected.
         _direction = *P_next - *P_current;
+        std::cout << "_direction=" << _direction << std::endl;
 
         // Calculate the vector that must be traveled to the intersection of the line defined by the
         // current node and direction vector and the plane defined by the direction vector at the
         // next point along the extrusion curve.
         travel_vector = ((*P_next - *node) * _direction / (_direction * _direction)) * _direction;
+        std::cout << "travel_vector=" << travel_vector << std::endl;
         Node * new_node = mesh->add_point(
             *node + travel_vector, node->id() + (i * orig_nodes), node->processor_id());
+        std::cout << "Next node: " << *node + travel_vector << std::endl;
+        std::cout << "Next node NORM=" << (*node + travel_vector).norm() << std::endl;
 
         // This might be completely wrong... Code was copied from above, then parameters e and
         // current_node_layer were changed to i from the loop it is in... MAKE SURE TO CHECK BEFORE
