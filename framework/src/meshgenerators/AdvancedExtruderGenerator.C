@@ -192,39 +192,38 @@ AdvancedExtruderGenerator::AdvancedExtruderGenerator(const InputParameters & par
       paramError("direction",
                  "direction and extrusion_curve are invalid. At least one of these parameters must "
                  "be set!");
-    else
+
+    // Normalize given direction vector
+    _direction /= _direction.norm();
+
+    // check to ensure required parameters are given
+    if (_heights.empty())
+      paramError("heights", "heights must be set to extrude input mesh!");
+    if (_num_layers.empty())
+      paramError("num_layers", "num_layers must be set to extrude input mesh!");
+
+    // define number of elevations based on user input
+    const auto num_elevations = _heights.size();
+
+    // add additional checks:
+    if (_num_layers.size() != num_elevations)
+      paramError(
+          "heights", "The length of 'heights' and 'num_layers' must be the same in ", name());
+
+    if (_subdomain_swaps.size() && (_subdomain_swaps.size() != num_elevations))
+      paramError("subdomain_swaps",
+                 "If specified, 'subdomain_swaps' (" + std::to_string(_subdomain_swaps.size()) +
+                     ") must be the same length as 'heights' (" + std::to_string(num_elevations) +
+                     ") in ",
+                 name());
+    //----------------------------------------------------------------------------------------------
+    // THE FOLLOWING WILL NEED TO BE CHECKED!!!
+    //----------------------------------------------------------------------------------------------
+    try
     {
-      // check to ensure required parameters are given
-      if (_heights.empty())
-        paramError("heights", "heights must be set to extrude input mesh!");
-      if (_num_layers.empty())
-        paramError("num_layers", "num_layers must be set to extrude input mesh!");
-
-      // Normalize given direction vector
-      _direction /= _direction.norm();
-
-      // define number of elevations based on user input
-      const auto num_elevations = _heights.size();
-
-      // add additional checks:
-      if (_num_layers.size() != num_elevations)
-        paramError(
-            "heights", "The length of 'heights' and 'num_layers' must be the same in ", name());
-
-      if (_subdomain_swaps.size() && (_subdomain_swaps.size() != num_elevations))
-        paramError("subdomain_swaps",
-                   "If specified, 'subdomain_swaps' (" + std::to_string(_subdomain_swaps.size()) +
-                       ") must be the same length as 'heights' (" + std::to_string(num_elevations) +
-                       ") in ",
-                   name());
-      //----------------------------------------------------------------------------------------------
-      // THE FOLLOWING WILL NEED TO BE CHECKED!!!
-      //----------------------------------------------------------------------------------------------
-      try
-      {
-        MooseMeshUtils::idSwapParametersProcessor(
-            name(), "subdomain_swaps", _subdomain_swaps, _subdomain_swap_pairs);
-      }
+      MooseMeshUtils::idSwapParametersProcessor(
+          name(), "subdomain_swaps", _subdomain_swaps, _subdomain_swap_pairs);
+    }
       catch (const MooseException & e)
       {
         paramError("subdomain_swaps", e.what());
@@ -319,7 +318,10 @@ AdvancedExtruderGenerator::AdvancedExtruderGenerator(const InputParameters & par
               "element of downward_boundary_source_blocks.");
     //----------------------------------------------------------------------------------------------
     //----------------------------------------------------------------------------------------------
-    }
+  }
+  else
+  {
+    // add all parameters that are not supported
   }
 }
 
@@ -395,9 +397,18 @@ AdvancedExtruderGenerator::generate()
   if (!input->is_serial())
     mesh->delete_remote_elements();
 
-  unsigned int total_num_layers = std::accumulate(_num_layers.begin(), _num_layers.end(), 0);
-
-  auto total_num_elevations = _heights.size();
+  unsigned int total_num_layers;
+  unsigned int total_num_elevations;
+  if (!_extrude_along_curve)
+  {
+    total_num_layers = std::accumulate(_num_layers.begin(), _num_layers.end(), 0);
+    total_num_elevations = _heights.size();
+  }
+  else
+  {
+    total_num_layers = extrusion_curve->n_elem();
+    total_num_elevations = 1;
+  }
 
   dof_id_type orig_elem = input->n_elem();
   dof_id_type orig_nodes = input->n_nodes();
@@ -537,16 +548,16 @@ AdvancedExtruderGenerator::generate()
 #endif
 
         input_boundary_info.boundary_ids(node, ids_to_copy);
-        if (_boundary_swap_pairs.empty())
-          boundary_info.add_node(new_node, ids_to_copy);
-        else
-          for (const auto & id_to_copy : ids_to_copy)
-          {
-            boundary_info.add_node(new_node,
-                                   _boundary_swap_pairs[e].count(id_to_copy)
-                                       ? _boundary_swap_pairs[e][id_to_copy]
-                                       : id_to_copy);
-          }
+        // if (_boundary_swap_pairs.empty())
+        //   boundary_info.add_node(new_node, ids_to_copy);
+        // else
+        //   for (const auto & id_to_copy : ids_to_copy)
+        //   {
+        //     boundary_info.add_node(new_node,
+        //                            _boundary_swap_pairs[e].count(id_to_copy)
+        //                                ? _boundary_swap_pairs[e][id_to_copy]
+        //                                : id_to_copy);
+        //   }
 
         old_distance = current_distance;
         current_node_layer++;
@@ -555,9 +566,13 @@ AdvancedExtruderGenerator::generate()
     }
     else
     {
+      unsigned int current_node_layer = 0;
+
       libMesh::Node * P_next;
       libMesh::Node * P_current;
       libMesh::RealVectorValue travel_vector;
+
+      auto num_layers = extrusion_curve->n_elem();
 
       std::cout << "Starting loop..." << std::endl;
       for (const auto i : make_range(extrusion_curve->n_nodes() - 1))
@@ -611,6 +626,8 @@ AdvancedExtruderGenerator::generate()
     }
   }
 
+  // std::cout << "total_num_elevations=" << total_num_elevations << std::endl;
+
   const auto & side_ids = input_boundary_info.get_side_boundary_ids();
 
   boundary_id_type next_side_id =
@@ -621,9 +638,12 @@ AdvancedExtruderGenerator::generate()
   // fix that.
   input->comm().max(next_side_id);
 
+  // std::cout << "\nI got here!\n" << std::endl;
+
   for (const auto & elem : input->element_ptr_range())
   {
     const ElemType etype = elem->type();
+    // std::cout << "\nI got here!\n" << std::endl;
 
     // build_extrusion currently only works on coarse meshes
     libmesh_assert(!elem->parent());
@@ -632,7 +652,11 @@ AdvancedExtruderGenerator::generate()
 
     for (unsigned int e = 0; e != total_num_elevations; e++)
     {
-      auto num_layers = _num_layers[e];
+      unsigned int num_layers;
+      if (!_extrude_along_curve)
+        num_layers = _num_layers[e];
+      else
+        num_layers = extrusion_curve->n_elem();
 
       for (unsigned int k = 0; k != num_layers; ++k)
       {
@@ -1125,7 +1149,7 @@ AdvancedExtruderGenerator::generate()
         new_elem->subdomain_id() = elem->subdomain_id();
 
         // define upward boundaries
-        if (k == num_layers - 1)
+        if (k == num_layers - 1 && _upward_boundary_source_blocks.size())
         {
           // Identify the side index of the new element that is part of the upward boundary
           const unsigned short top_id =
@@ -1138,7 +1162,7 @@ AdvancedExtruderGenerator::generate()
                   new_elem.get(), is_flipped ? 0 : top_id, _upward_boundary_ids[e][i]);
         }
         // define downward boundaries
-        if (k == 0)
+        if (k == 0 && _downward_boundary_source_blocks.size())
         {
           const unsigned short top_id =
               new_elem->dim() == 3 ? cast_int<unsigned short>(elem->n_sides() + 1) : 2;
